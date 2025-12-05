@@ -32,7 +32,11 @@ _url_re = re.compile(
     )
     """
 )
-
+def resource_path(relative_path):
+    """获取打包后资源的正确路径"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
 def extract_first_url(text: str) -> str | None:
     """从文本中提取第一个 URL，若无则返回 None。
@@ -533,7 +537,7 @@ class QRApp(QWidget):
     def init_tray(self):
         # 1) 尝试加载实际文件 ico（如果有）
         here = os.path.dirname(__file__)
-        ico_path = os.path.join(here, "icon.png")
+        ico_path = os.path.join(here, resource_path("icon.ico"))
         if os.path.exists(ico_path):
             tray_icon = QIcon(ico_path)
         else:
@@ -552,7 +556,9 @@ class QRApp(QWidget):
         self.tray_menu = QMenu(parent=self)
 
         self.show_act = QAction("显示主窗口", parent=self)
-        self.show_act.triggered.connect(self.show)
+        # self.show_act.triggered.connect(self.show)
+        self.show_act.triggered.connect(self.show_main_window)
+
         self.tray_menu.addAction(self.show_act)
 
         self.cap_act = QAction("截屏识别", parent=self)
@@ -560,8 +566,11 @@ class QRApp(QWidget):
         self.tray_menu.addAction(self.cap_act)
 
         self.quit_act = QAction("退出", parent=self)
-        self.quit_act.triggered.connect(QApplication.quit)
+        # self.quit_act.triggered.connect(QApplication.quit)
+
+        self.quit_act.triggered.connect(self.force_quit)
         self.tray_menu.addAction(self.quit_act)
+
 
         # 4) 设置托盘上下文菜单
         self.tray.setContextMenu(self.tray_menu)
@@ -580,7 +589,22 @@ class QRApp(QWidget):
         # 6) 显示托盘图标
         self.tray.show()
 
+    def show_main_window(self):
+        self.show()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def force_quit(self):
+        self._force_quit = True
+        self.tray.hide()
+        QApplication.quit()
+
     def closeEvent(self, e):
+        if getattr(self, "_force_quit", False):
+            e.accept()
+            return
+
         e.ignore()
         self.hide()
         self.tray.showMessage(
@@ -596,7 +620,7 @@ class QRApp(QWidget):
 # ================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("icon.png"))
+    app.setWindowIcon(QIcon(resource_path("icon.ico")))
     w = QRApp()
     w.show()
     sys.exit(app.exec())

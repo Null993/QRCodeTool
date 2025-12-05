@@ -1,1 +1,8 @@
 /.idea
+/.idea
+history.json
+/dist
+/build
+icon.png
+main.spec
+QRCodeTool.spec

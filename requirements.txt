@@ -1,0 +1,7 @@
+pyside6
+numpy
+opencv-python
+django-qrcode
+
+
+
