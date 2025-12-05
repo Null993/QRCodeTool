@@ -86,5 +86,5 @@ python main.py
 ---
 
 ## 📜 License  
-本项目可自由使用、二次开发，但请保留署名：Null993
+本项目采用 Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0) 许可证发布。
 
