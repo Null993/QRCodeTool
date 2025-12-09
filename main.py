@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import io
 from io import BytesIO
 from datetime import datetime
 import webbrowser
@@ -8,23 +9,19 @@ import re
 import cv2
 import numpy as np
 import qrcode
-from qreader import QReader
 import warnings
 warnings.filterwarnings("ignore", message="Double decoding failed")
-
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QTabWidget, QVBoxLayout, QLabel, QPushButton,
-    QTextEdit, QFileDialog, QLineEdit, QSystemTrayIcon, QStyle, QMenu,
-    QListWidget, QListWidgetItem, QMessageBox, QHBoxLayout, QCheckBox, QSizePolicy
-)
-from PySide6.QtGui import (
-    QPixmap, QAction, QGuiApplication, QPainter, QPen, QColor, QImage, QIcon
-)
-from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal
 
 # ---------- 常量 ----------
 HISTORY_FILE = "history.json"
 CONFIG_FILE = "config.json"
+MODEL_FILE = "model/qrdet-s.pt"  # 你的本地模型相对路径（相对于 main.py 或打包后的 _MEIPASS）
+
+def resource_path(relative_path):
+    """获取打包后资源的正确路径"""
+    if hasattr(sys, '_MEIPASS'):
+        return str(os.path.join(sys._MEIPASS, relative_path))
+    return str(os.path.join(os.path.abspath("."), relative_path))
 
 # ---------- 正则：识别文本中的第一个 URL（支持不带 scheme 的裸域名 / www） ----------
 _url_re = re.compile(
@@ -36,12 +33,6 @@ _url_re = re.compile(
     )
     """
 )
-def resource_path(relative_path):
-    """获取打包后资源的正确路径"""
-    if hasattr(sys, '_MEIPASS'):
-        return str(os.path.join(sys._MEIPASS, relative_path))
-    return str(os.path.join(os.path.abspath("."), relative_path))
-
 def extract_first_url(text: str) -> str | None:
     """从文本中提取第一个 URL，若无则返回 None。
        若提取到裸域名或以 www. 开头的，会补上 http:// 以便 webbrowser.open 使用。"""
@@ -53,6 +44,85 @@ def extract_first_url(text: str) -> str | None:
         url = "http://" + url
     return url
 
+# ---------------------------
+# Monkey patch requests -> 当请求 qrdet-s.pt 时直接返回本地文件流（模拟下载成功）
+# ---------------------------
+try:
+    import requests
+    import requests.sessions
+    from requests.models import Response as RequestsResponse
+
+    # 本地模型路径（优先使用 resource_path，兼容打包）
+    LOCAL_MODEL_PATH = resource_path(MODEL_FILE)
+
+    _orig_requests_get = requests.get
+    _orig_session_request = requests.sessions.Session.request
+
+    def _build_response_from_file(path: str, url: str) -> RequestsResponse:
+        """用本地文件内容构建一个 requests.Response，模拟远程下载流式返回。"""
+        data_size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            data = f.read()
+
+        resp = RequestsResponse()
+        resp.status_code = 200
+        resp._content = data  # .content 属性
+        resp.headers["Content-Length"] = str(data_size)
+        resp.url = url
+
+        # raw 需要类文件对象（requests/urllib3 可能直接读取 raw.read()）
+        resp.raw = io.BytesIO(data)
+
+        # 提供 iter_content 方法（requests 有时直接调用它）
+        def iter_content(chunk_size=8192):
+            for i in range(0, len(data), chunk_size):
+                yield data[i:i + chunk_size]
+        resp.iter_content = iter_content
+
+        return resp
+
+    def _fake_get(url, *args, **kwargs):
+        # 精准匹配 qrdet 模型文件名，必要时你可以把匹配放宽/放严
+        if isinstance(url, str) and "qrdet-s.pt" in url:
+            if os.path.exists(LOCAL_MODEL_PATH):
+                print(f"[patch] serving local model for {url} -> {LOCAL_MODEL_PATH}")
+                return _build_response_from_file(LOCAL_MODEL_PATH, url)
+            else:
+                # 如果本地模型不存在，打印提示并回退到真实请求（若你希望强制失败也可改成抛错）
+                print(f"[patch] local model not found at {LOCAL_MODEL_PATH}, falling back to real request")
+                return _orig_requests_get(url, *args, **kwargs)
+        # 非模型请求：正常转发
+        return _orig_requests_get(url, *args, **kwargs)
+
+    def _fake_session_request(self, method, url, *args, **kwargs):
+        if method and method.upper() == "GET" and isinstance(url, str) and "qrdet-s.pt" in url:
+            return _fake_get(url, *args, **kwargs)
+        return _orig_session_request(self, method, url, *args, **kwargs)
+
+    # 应用 monkey patch（在导入 qreader/qrdet 之前执行）
+    requests.get = _fake_get
+    requests.sessions.Session.request = _fake_session_request
+
+    print("[patch] requests monkey-patch installed for qrdet-s.pt")
+except Exception as e:
+    # 如果 patch 失败，继续运行但打印错误（不阻塞程序）
+    print("[patch] failed to install requests patch:", e)
+
+# 现在安全导入 QReader（在上面的 patch 生效后）
+from qreader import QReader
+
+# ---------------------------
+# GUI 相关导入
+# ---------------------------
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QTabWidget, QVBoxLayout, QLabel, QPushButton,
+    QTextEdit, QFileDialog, QLineEdit, QSystemTrayIcon, QStyle, QMenu,
+    QListWidget, QListWidgetItem, QMessageBox, QHBoxLayout, QCheckBox, QSizePolicy
+)
+from PySide6.QtGui import (
+    QPixmap, QAction, QGuiApplication, QPainter, QPen, QColor, QImage, QIcon
+)
+from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal
 
 # ================================
 #       截图框选窗口（高 DPI 修复）
@@ -187,7 +257,27 @@ class QRApp(QWidget):
         self.hotkey_triggered.connect(self.start_capture)
 
         self.start_hotkey_listener()
-        self.qr_reader = QReader()
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Ensure model folder exists (helpful for first-run)
+        model_folder = os.path.join(base_dir, "model")
+        os.makedirs(model_folder, exist_ok=True)
+
+        # 检查本地模型是否存在（用户需要把 qrdet-s.pt 放在 model/ 目录）
+        model_full = resource_path(MODEL_FILE)
+        if not os.path.exists(model_full):
+            QMessageBox.critical(
+                None,
+                "缺少模型文件",
+                f"未找到本地模型：{model_full}\n\n请把 qrdet-s.pt 放到此路径，或修改 MODEL_FILE 常量。",
+            )
+            raise FileNotFoundError(f"Missing model file: {model_full}")
+
+        # 重要：通过 QReader 的构造（weights_folder）指向固定目录（作为双保险）
+        self.qr_reader = QReader(
+            model_size="s",
+            weights_folder=os.path.join(base_dir, "model")
+        )
 
         self.init_tray()
 
@@ -238,9 +328,6 @@ class QRApp(QWidget):
         self.hotkey = hk
         self.start_hotkey_listener()
         QMessageBox.information(self, "成功", f"已保存快捷键：{hk}")
-
-
-
 
     def update_decode_preview(self):
         """根据 decode_preview 大小自动缩放预览图片（处理 DPI 与布局时序）"""
@@ -715,21 +802,13 @@ class QRApp(QWidget):
         self.decode_text.updateGeometry()
         if self.decode_preview.parent():
             self.decode_preview.parent().updateGeometry()
+
     # 点击可打开 URL
-    # def open_link_if_needed(self, e):
-    #     try:
-    #         cursor = self.decode_text.cursorForPosition(e.position().toPoint())
-    #     except Exception:
-    #         cursor = self.decode_text.textCursor()
-    #     cursor.select(cursor.SelectionType.LineUnderCursor)
-    #     line = cursor.selectedText().strip()
-    #     if extract_first_url(line) is None:
-    #         QApplication.clipboard().setText(line)
-    #         return
-    #     else:
-    #         webbrowser.open(line)
     def open_link_if_needed(self, e):
-        pos = e.position().toPoint()
+        try:
+            pos = e.position().toPoint()
+        except Exception:
+            pos = e.pos()
         cursor = self.decode_text.cursorForPosition(pos)
 
         fmt = cursor.charFormat()
@@ -745,8 +824,6 @@ class QRApp(QWidget):
         text = cursor.selectedText().strip()
         QApplication.clipboard().setText(text)
 
-
-
     def open_decode(self):
         fn, _ = QFileDialog.getOpenFileName(self, "选择图片", filter="Images (*.png *.jpg *.jpeg)")
         if not fn:
@@ -757,8 +834,6 @@ class QRApp(QWidget):
         self.update_decode_preview()
         self.decode_file(fn)
 
-
-
     def decode_file(self, fn):
         img = cv2.imdecode(np.fromfile(fn, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
@@ -766,7 +841,6 @@ class QRApp(QWidget):
 
         # 尝试多二维码识别
         return self.detect_all_selector(img,"解析图片",self.config["detect_all_plus"])
-
 
     # ==========================
     #         截屏识别
@@ -800,20 +874,6 @@ class QRApp(QWidget):
             return self.detect_all_plus(img,source)
         else:
             return self.detect_all(img,source)
-
-
-    # def detect_all(self, img,source):
-    #     ok, texts, pts, _ = self.detector.detectAndDecodeMulti(img)
-    #     if ok and texts:
-    #         texts = [t for t in texts if t]
-    #         if texts:
-    #             self.decode_text.setPlainText("\n".join(texts))
-    #             for t in texts:
-    #                 self.add_history(source, t)
-    #             return texts
-    #
-    #     self.decode_text.setPlainText("未识别出二维码")
-    #     return None
 
     def detect_all(self, img, source):
         ok, texts, pts, _ = self.detector.detectAndDecodeMulti(img)
@@ -855,26 +915,6 @@ class QRApp(QWidget):
         )
         return None
 
-    # def detect_all_plus(self, img, source):
-    #
-    #     result = self.qr_reader.detect_and_decode(image=img, is_bgr=True)
-    #
-    #     # detect_and_decode 返回的是 tuple[str|None, ...]
-    #     if not result:
-    #         self.decode_text.setPlainText("未识别出二维码")
-    #         return None
-    #
-    #     texts = [t.strip() for t in result if t]
-    #
-    #     if not texts:
-    #         self.decode_text.setPlainText("未识别出二维码")
-    #         return None
-    #
-    #     self.decode_text.setPlainText("\n".join(texts))
-    #     for t in texts:
-    #         self.add_history(source, t)
-    #
-    #     return texts
     def detect_all_plus(self, img, source):
 
         result = self.qr_reader.detect_and_decode(image=img, is_bgr=True)
@@ -1012,7 +1052,6 @@ class QRApp(QWidget):
             QSystemTrayIcon.MessageIcon.Information,
             2000
         )
-
 
 # ================================
 #             启动
