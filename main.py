@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore", message="Double decoding failed")
 # ---------- 常量 ----------
 HISTORY_FILE = "history.json"
 CONFIG_FILE = "config.json"
-MODEL_FILE = "model/qrdet-s.pt"  # 你的本地模型相对路径（相对于 main.py 或打包后的 _MEIPASS）
+MODEL_FILE = "model/qrdet-s.pt"  # 本地模型相对路径（相对于 main.py 或打包后的 _MEIPASS）
 
 def resource_path(relative_path):
     """获取打包后资源的正确路径"""
@@ -82,13 +82,13 @@ try:
         return resp
 
     def _fake_get(url, *args, **kwargs):
-        # 精准匹配 qrdet 模型文件名，必要时你可以把匹配放宽/放严
+        # 精准匹配 qrdet 模型文件名
         if isinstance(url, str) and "qrdet-s.pt" in url:
             if os.path.exists(LOCAL_MODEL_PATH):
                 print(f"[patch] serving local model for {url} -> {LOCAL_MODEL_PATH}")
                 return _build_response_from_file(LOCAL_MODEL_PATH, url)
             else:
-                # 如果本地模型不存在，打印提示并回退到真实请求（若你希望强制失败也可改成抛错）
+                # 如果本地模型不存在，打印提示并回退到真实请求
                 print(f"[patch] local model not found at {LOCAL_MODEL_PATH}, falling back to real request")
                 return _orig_requests_get(url, *args, **kwargs)
         # 非模型请求：正常转发
