@@ -1,3 +1,5 @@
+pyzbar
+keyboard
 pyside6
 numpy
 opencv-python

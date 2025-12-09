@@ -8,35 +8,39 @@ import re
 import cv2
 import numpy as np
 import qrcode
+from qreader import QReader
+import warnings
+warnings.filterwarnings("ignore", message="Double decoding failed")
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QTabWidget, QVBoxLayout, QLabel, QPushButton,
     QTextEdit, QFileDialog, QLineEdit, QSystemTrayIcon, QStyle, QMenu,
-    QListWidget, QListWidgetItem, QMessageBox, QHBoxLayout, QCheckBox
+    QListWidget, QListWidgetItem, QMessageBox, QHBoxLayout, QCheckBox, QSizePolicy
 )
 from PySide6.QtGui import (
-    QPixmap, QAction, QGuiApplication, QPainter, QPen, QColor, QImage, QIcon, QCursor
+    QPixmap, QAction, QGuiApplication, QPainter, QPen, QColor, QImage, QIcon
 )
-from PySide6.QtCore import Qt, QRect, QPoint
+from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal
 
 # ---------- 常量 ----------
 HISTORY_FILE = "history.json"
+CONFIG_FILE = "config.json"
 
 # ---------- 正则：识别文本中的第一个 URL（支持不带 scheme 的裸域名 / www） ----------
 _url_re = re.compile(
     r"""(?xi)
     (
-      (?:https?://[^\s'"]+) |                     # 带 http(s) 的完整 URL
-      (?:www\.[^\s'"]+) |                         # 以 www. 开头的
-      (?:[a-z0-9\-.]+\.(?:com|net|org|io|gov|cn|xyz|top|info|biz|site|tech|me)(?:/[^\s'"]*)?) # 裸域名+常见TLD（带可选路径）
+      https?://[^\s'"]+ |                     # 带 http(s) 的完整 URL
+      www\.[^\s'"]+ |                         # 以 www. 开头的
+      [a-z0-9\-.]+\.(?:com|net|org|io|gov|cn|xyz|top|info|biz|site|tech|me)(?:/[^\s'"]*)? # 裸域名+常见TLD（带可选路径）
     )
     """
 )
 def resource_path(relative_path):
     """获取打包后资源的正确路径"""
     if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+        return str(os.path.join(sys._MEIPASS, relative_path))
+    return str(os.path.join(os.path.abspath("."), relative_path))
 
 def extract_first_url(text: str) -> str | None:
     """从文本中提取第一个 URL，若无则返回 None。
@@ -54,13 +58,15 @@ def extract_first_url(text: str) -> str | None:
 #       截图框选窗口（高 DPI 修复）
 # ================================
 class CaptureScreen(QWidget):
-    def __init__(self, callback):
+    def __init__(self, callback, cancel_callback=None):
         super().__init__()
         self.callback = callback
+        self.cancel_callback = cancel_callback
 
-        self.setWindowFlag(Qt.FramelessWindowHint)
-        self.setWindowState(Qt.WindowFullScreen)
-        self.setCursor(Qt.CrossCursor)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)   # ⭐ 置顶
+        self.setWindowState(Qt.WindowState.WindowFullScreen)
+        self.setCursor(Qt.CursorShape.CrossCursor)
 
         screen = QGuiApplication.primaryScreen()
         self.dpr = screen.devicePixelRatio()
@@ -81,7 +87,7 @@ class CaptureScreen(QWidget):
             p.drawRect(rect)
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
+        if e.button() == Qt.MouseButton.LeftButton:
             # Qt 6: e.position(); Qt 5: e.pos()
             try:
                 p = e.position().toPoint()
@@ -100,8 +106,9 @@ class CaptureScreen(QWidget):
                 self.end = e.pos()
             self.update()
 
+    # ---------- CaptureScreen.mouseReleaseEvent（替换原有实现） ----------
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.LeftButton:
+        if e.button() == Qt.MouseButton.LeftButton:
             self.selecting = False
             try:
                 self.end = e.position().toPoint()
@@ -110,31 +117,60 @@ class CaptureScreen(QWidget):
 
             rect = QRect(self.start, self.end).normalized()
             if rect.width() > 5 and rect.height() > 5:
+                # 使用从抓取到的 pixmap 获取的 devicePixelRatio（更稳健）
+                pix_dpr = getattr(self.full_pix, "devicePixelRatio", lambda: 1)()
+                if not pix_dpr:
+                    pix_dpr = 1.0
+
+                # 将逻辑坐标转换为物理像素坐标再裁剪
                 real_rect = QRect(
-                    int(rect.x() * self.dpr),
-                    int(rect.y() * self.dpr),
-                    int(rect.width() * self.dpr),
-                    int(rect.height() * self.dpr)
+                    int(rect.x() * pix_dpr),
+                    int(rect.y() * pix_dpr),
+                    int(rect.width() * pix_dpr),
+                    int(rect.height() * pix_dpr),
                 )
 
+                # 避免越界（clip 到原始 pixmap 的物理尺寸）
+                phys_w = int(self.full_pix.width() * pix_dpr)
+                phys_h = int(self.full_pix.height() * pix_dpr)
+                full_phys_rect = QRect(0, 0, phys_w, phys_h)
+                real_rect = real_rect.intersected(full_phys_rect)
+
                 cropped = self.full_pix.copy(real_rect)
-                self.callback(cropped)
+
+                # 确保 cropped 的 devicePixelRatio 被正确设置（与原始 pixmap 一致）
+                try:
+                    cropped.setDevicePixelRatio(pix_dpr)
+                except Exception:
+                    # 某些 Qt 版本/平台可能不支持，忽略失败
+                    pass
+
+                # self.callback(cropped)
+                # 在 CaptureScreen.mouseReleaseEvent 中把 self.callback(cropped) 改为：
+                QTimer.singleShot(0, lambda pix=cropped: self.callback(pix))
 
             self.close()
 
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key_Escape:
+        if e.key() == Qt.Key.Key_Escape:
+            if self.cancel_callback:
+                self.cancel_callback()  # 通知主窗口恢复
             self.close()
-
 
 # ================================
 #           主程序
 # ================================
 class QRApp(QWidget):
+    hotkey_triggered = Signal()
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("二维码工具  By Null993")
+
+        self.chk_all = None
+        self.hotkey_handle = None
+        self.setWindowTitle("二维码工具 v1.1  By Null993")
         self.resize(700, 520)
+        self.config = self.load_config()
 
         self.detector = cv2.QRCodeDetector()
         self.history = self.load_history()
@@ -146,17 +182,113 @@ class QRApp(QWidget):
         self.tabs.addTab(self.page_generate(), "生成二维码")
         self.tabs.addTab(self.page_decode(), "解析二维码")
         self.tabs.addTab(self.page_history(), "历史记录")
+        self.tabs.addTab(self.page_hotkey(), "热键设置")
+
+        self.hotkey_triggered.connect(self.start_capture)
+
+        self.start_hotkey_listener()
+        self.qr_reader = QReader()
 
         self.init_tray()
+
+    def load_config(self):
+        if not os.path.exists(CONFIG_FILE):
+            return {"hotkey": "", "detect_all_plus": False}
+        try:
+            return json.load(open(CONFIG_FILE, "r", encoding="utf8"))
+        except:
+            return {"hotkey": "", "detect_all_plus": False}
+
+    def save_config(self):
+        json.dump(self.config, open(CONFIG_FILE, "w", encoding="utf8"),
+                  ensure_ascii=False, indent=2)
+
+    def start_hotkey_listener(self):
+        import keyboard
+
+        # 注销旧热键
+        if hasattr(self, "hotkey_handle") and self.hotkey_handle:
+            try:
+                keyboard.remove_hotkey(self.hotkey_handle)
+                print("Old hotkey removed")
+            except:
+                pass
+            self.hotkey_handle = None
+
+        hk = self.hotkey or self.config.get("hotkey", "")
+        if not hk:
+            return
+
+        try:
+            # 注意：不要直接把 self.start_capture 作为回调（会在 keyboard 线程执行）
+            # 改为在回调中 emit 一个 Qt 信号，信号会在 GUI 线程触发 start_capture
+            self.hotkey_handle = keyboard.add_hotkey(hk, lambda: self.hotkey_triggered.emit())
+            print("Hotkey registered:", hk)
+        except Exception as e:
+            print("Hotkey registration failed:", e)
+
+    def save_hotkey(self):
+        hk = self.hotkey_input.text().strip()
+        if hk == "":
+            QMessageBox.warning(self, "错误", "快捷键不能为空")
+            return
+        self.config["hotkey"] = hk
+        # json.dump({"hotkey": hk}, open(resource_path(CONFIG_FILE), "w", encoding="utf8"))
+        self.save_config()
+        self.hotkey = hk
+        self.start_hotkey_listener()
+        QMessageBox.information(self, "成功", f"已保存快捷键：{hk}")
+
+
+
+    # ---------- update_decode_preview（替换原有实现） ----------
+    def update_decode_preview(self):
+        """根据 decode_preview 大小自动缩放预览图片（处理 DPI 与布局时序）"""
+        if not hasattr(self, "_orig_decode_pixmap"):
+            return
+
+        pix = self._orig_decode_pixmap
+        label = self.decode_preview
+
+        # 如果 label 还没 layout 好（size 为 0），稍后重试
+        if label.width() == 0 or label.height() == 0:
+            QTimer.singleShot(100, self.update_decode_preview)
+            return
+
+        # 如果 pixmap 有 devicePixelRatio（高 DPI），把它规范化为 DPR = 1 的 QPixmap 再缩放
+        # 这样 scaled() 的目标尺寸就是“逻辑像素”一致的。
+        dpr = getattr(pix, "devicePixelRatio", lambda: 1)()
+        if not dpr:
+            dpr = 1.0
+
+        if dpr != 1.0:
+            # 把 pixmap 转为 QImage（物理像素），然后从 image 重建一个 DPR=1 的 pixmap
+            img = pix.toImage()
+            # 确保 image 的 devicePixelRatio 为 1，再从 image 创建 pixmap
+            try:
+                img.setDevicePixelRatio(1.0)
+            except Exception:
+                pass
+            disp_pix = QPixmap.fromImage(img)
+        else:
+            disp_pix = pix
+
+        # 使用 label 的当前逻辑尺寸进行等比缩放并设置
+        scaled = disp_pix.scaled(label.width(), label.height(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_decode_preview()
 
     # ==========================
     #        历史记录
     # ==========================
     def load_history(self):
         """加载历史记录，兼容新旧格式"""
-        if os.path.exists(HISTORY_FILE):
+        if os.path.exists(resource_path(HISTORY_FILE)):
             try:
-                history = json.load(open(HISTORY_FILE, "r", encoding="utf8"))
+                history = json.load(open(resource_path(HISTORY_FILE), "r", encoding="utf8"))
                 # 兼容旧格式：将旧格式转换为新格式
                 converted_history = []
                 for item in history:
@@ -192,7 +324,7 @@ class QRApp(QWidget):
         return []
 
     def save_history(self):
-        json.dump(self.history, open(HISTORY_FILE, "w", encoding="utf8"),
+        json.dump(self.history, open(resource_path(HISTORY_FILE), "w", encoding="utf8"),
                   ensure_ascii=False, indent=2)
 
     def add_history(self, source, content):
@@ -225,7 +357,7 @@ class QRApp(QWidget):
         v.addLayout(h)
 
         self.list = QListWidget()
-        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         # 使用 itemChanged 信号处理勾选，避免与点击事件冲突
         self.list.itemChanged.connect(self.on_item_changed)
@@ -240,6 +372,43 @@ class QRApp(QWidget):
 
         self.refresh_history()
         return w
+
+    def page_hotkey(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+
+        # 第一行：提示文字
+        lab = QLabel("按下你希望用于『截屏识别』的快捷键（如 F1、Ctrl+Shift+S）")
+        # lab.setSizePolicy(
+        #     QSizePolicy.Policy.Minimum,
+        #     QSizePolicy.Policy.Minimum
+        # )
+        v.addWidget(lab, stretch=0)
+
+        # 第二行：按钮 + 输入框
+        h = QHBoxLayout()
+        self.hotkey_input = QLineEdit()
+        self.hotkey_input.setPlaceholderText("按键将自动记录")
+        h.addWidget(self.hotkey_input)
+
+        save_btn = QPushButton("保存快捷键")
+        save_btn.clicked.connect(self.save_hotkey)
+        h.addWidget(save_btn)
+
+        v.addLayout(h, stretch=0)
+        v.addStretch(1)  # stretch=1，吸收所有剩余空间
+
+        # 读取已保存热键
+        self.hotkey = self.config.get("hotkey", "")
+        if self.hotkey:
+            self.hotkey_input.setText(self.hotkey)
+
+        # 监听键盘记录快捷键（只记录组合，不实际触发）
+        self.hotkey_input.keyPressEvent = self.record_hotkey
+
+        return w
+
     def refresh_history(self):
         if not hasattr(self, "list"):
             return
@@ -254,11 +423,11 @@ class QRApp(QWidget):
             item = QListWidgetItem(display_text)
 
             # 设置可勾选
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
 
             # 保存原始数据到自定义数据角色
-            item.setData(Qt.UserRole, h)
+            item.setData(Qt.ItemDataRole.UserRole, h)
 
             self.list.addItem(item)
 
@@ -273,12 +442,34 @@ class QRApp(QWidget):
         # 更新全选复选框状态
         self.update_select_all_checkbox()
 
+    def record_hotkey(self, e):
+        keys = []
+
+        if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            keys.append("ctrl")
+        if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            keys.append("shift")
+        if e.modifiers() & Qt.KeyboardModifier.AltModifier:
+            keys.append("alt")
+
+        key = e.key()
+
+        # 处理 F1-F12
+        if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F35:
+            keys.append(f"f{key - Qt.Key.Key_F1 + 1}")
+        else:
+            key_name = e.text().lower()
+            if key_name:
+                keys.append(key_name)
+
+        self.hotkey_input.setText("+".join(keys))
+
     def update_select_all_checkbox(self):
         """程序性更新 chk_all 的显示（不会被当成用户点击）"""
         count = self.list.count()
         if count == 0:
             self.chk_all.blockSignals(True)
-            self.chk_all.setCheckState(Qt.Unchecked)
+            self.chk_all.setCheckState(Qt.CheckState.Unchecked)
             self.chk_all.blockSignals(False)
             self.chk_all.setEnabled(False)
             return
@@ -287,21 +478,22 @@ class QRApp(QWidget):
 
         checked_count = 0
         for i in range(count):
-            if self.list.item(i).checkState() == Qt.Checked:
+            if self.list.item(i).checkState() == Qt.CheckState.Checked:
                 checked_count += 1
 
         # 程序性设置 chk_all 的显示时阻断信号，避免触发 toggle_all
         self.chk_all.blockSignals(True)
 
         if checked_count == 0:
-            self.chk_all.setCheckState(Qt.Unchecked)
+            self.chk_all.setCheckState(Qt.CheckState.Unchecked)
         elif checked_count == count:
-            self.chk_all.setCheckState(Qt.Checked)
+            self.chk_all.setCheckState(Qt.CheckState.Checked)
         else:
-            self.chk_all.setCheckState(Qt.PartiallyChecked)
+            self.chk_all.setCheckState(Qt.CheckState.PartiallyChecked)
 
         self.chk_all.blockSignals(False)
 
+    # noinspection PyUnreachableCode
     def toggle_all(self, checked):
         """只在用户点击全选复选框时调用（checked 为用户点击后的状态）"""
         # 1) 阻断 list 的 itemChanged 信号，避免每次 item.setCheckState 触发 update_select_all_checkbox
@@ -309,14 +501,17 @@ class QRApp(QWidget):
         try:
             for i in range(self.list.count()):
                 item = self.list.item(i)
-                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         finally:
             self.list.blockSignals(False)
 
         # 2) 明确把 chk_all 设置为用户想要的状态，临时阻断其信号以避免重复触发
+
         self.chk_all.blockSignals(True)
-        self.chk_all.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self.chk_all.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self.chk_all.blockSignals(False)
+
+
     def delete_selected(self):
         """删除选中的记录"""
         items_to_delete = []
@@ -324,7 +519,7 @@ class QRApp(QWidget):
         # 收集要删除的项目
         for i in range(self.list.count()):
             item = self.list.item(i)
-            if item.checkState() == Qt.Checked:
+            if item.checkState() == Qt.CheckState.Checked:
                 # 获取对应的历史记录索引（因为显示是倒序的）
                 history_index = len(self.history) - 1 - i
                 items_to_delete.append(history_index)
@@ -345,7 +540,7 @@ class QRApp(QWidget):
     # 双击历史项：如果包含 URL -> 打开
     def on_history_double_click(self, item: QListWidgetItem):
         """双击项目时打开链接"""
-        data = item.data(Qt.UserRole)
+        data = item.data(Qt.ItemDataRole.UserRole)
         if data and "content" in data:
             content = data["content"]
             url = extract_first_url(content)
@@ -364,7 +559,7 @@ class QRApp(QWidget):
             return
 
         # 从自定义数据中获取原始内容
-        data = item.data(Qt.UserRole)
+        data = item.data(Qt.ItemDataRole.UserRole)
         if data and "content" in data:
             content = data["content"]
             QApplication.clipboard().setText(content)
@@ -380,7 +575,7 @@ class QRApp(QWidget):
                 self.tray.showMessage(
                     "已复制",
                     f"内容已复制到剪贴板：\n{display_content}",
-                    QSystemTrayIcon.Information,
+                    QSystemTrayIcon.MessageIcon.Information,
                     1500
                 )
 
@@ -400,7 +595,7 @@ class QRApp(QWidget):
         v.addWidget(btn)
 
         self.qr_label = QLabel("二维码预览")
-        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self.qr_label)
 
         save = QPushButton("保存二维码")
@@ -414,18 +609,18 @@ class QRApp(QWidget):
         if not text:
             return
 
-        qr = qrcode.QRCode(box_size=8, border=2)
+        qr = qrcode.main.QRCode(box_size=8, border=2)
         qr.add_data(text)
         qr.make()
         img = qr.make_image()
 
         buf = BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf)
         self.qr_data = buf.getvalue()
 
         pix = QPixmap()
         pix.loadFromData(self.qr_data)
-        self.qr_label.setPixmap(pix.scaled(300, 300, Qt.KeepAspectRatio))
+        self.qr_label.setPixmap(pix.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio))
 
         # 修改：使用新格式添加历史记录
         self.add_history("生成", text)
@@ -443,34 +638,96 @@ class QRApp(QWidget):
     def page_decode(self):
         w = QWidget()
         v = QVBoxLayout(w)
+        # detect_all_plus 开关
+        self.chk_detect_plus = QCheckBox("启用增强识别（可识别异形、特殊二维码）")
 
         btn = QPushButton("选择图片解析")
         btn.clicked.connect(self.open_decode)
         v.addWidget(btn)
 
+
+        self.chk_detect_plus.setChecked(self.config.get("detect_all_plus", False))
+        self.chk_detect_plus.stateChanged.connect(self.on_detect_plus_changed)
+        v.addWidget(self.chk_detect_plus)
+
         cap_btn = QPushButton("截屏识别")
         cap_btn.clicked.connect(self.start_capture)
         v.addWidget(cap_btn)
 
+        # 图片预览区域
         self.decode_preview = QLabel("图片预览")
-        self.decode_preview.setAlignment(Qt.AlignCenter)
-        v.addWidget(self.decode_preview)
+        self.decode_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.decode_preview.setScaledContents(False)
+        self.decode_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding
+        )
+        self.decode_preview.setMinimumSize(200, 200)
+        v.addWidget(self.decode_preview, stretch=1)  # 占据剩余空间
 
-        self.decode_text = QLineEdit()
+        # 文本结果显示区域
+        self.decode_text = QTextEdit()
         self.decode_text.setReadOnly(True)
-        self.decode_text.setStyleSheet("color:blue; text-decoration: underline;")
+        self.decode_text.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred  # Preferred: 根据内容确定合适大小
+        )
+        self.decode_text.setMaximumHeight(300)  # 设置最大高度限制
+        self.decode_text.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         self.decode_text.mousePressEvent = self.open_link_if_needed
+
+        # 监听文本变化
+        self.decode_text.textChanged.connect(self.update_decode_text_size)
+
+        # 初始设置合适的高度
+        self.decode_text.setFixedHeight(int(self.decode_text.document().size().height() + 20))
+
         v.addWidget(self.decode_text)
 
         return w
 
+    def on_detect_plus_changed(self):
+        self.config["detect_all_plus"] = self.chk_detect_plus.isChecked()
+        self.save_config()
+
+    def update_decode_text_size(self):
+        """根据文本内容更新decode_text的大小"""
+        # 获取文档的理想高度
+        doc_height = self.decode_text.document().size().height()
+
+        # 加上一些边距（大约20像素）
+        needed_height = doc_height + 20
+
+        # 限制最小和最大高度
+        min_height = 30
+        max_height = 300
+
+        if needed_height < min_height:
+            needed_height = min_height
+        elif needed_height > max_height:
+            needed_height = max_height
+
+        # 设置固定高度
+        self.decode_text.setFixedHeight(needed_height)
+
+        # 强制更新布局，确保图片预览区域能重新计算可用空间
+        self.decode_text.updateGeometry()
+        if self.decode_preview.parent():
+            self.decode_preview.parent().updateGeometry()
     # 点击可打开 URL
     def open_link_if_needed(self, e):
-        text = self.decode_text.text()
-        if text.startswith("http://") or text.startswith("https://"):
-            webbrowser.open(text)
+        cursor = self.decode_text.cursorForPosition(e.position().toPoint())
+        cursor.select(cursor.SelectionType.LineUnderCursor)
+        line = cursor.selectedText().strip()
+
+        # 如果当前行是 URL，则打开
+        if extract_first_url(line) is None:
+            QApplication.clipboard().setText(line)
+            return
         else:
-            QApplication.clipboard().setText(text)
+            webbrowser.open(line)
+
+
 
     def open_decode(self):
         fn, _ = QFileDialog.getOpenFileName(self, "选择图片", filter="Images (*.png *.jpg *.jpeg)")
@@ -478,46 +735,119 @@ class QRApp(QWidget):
             return
 
         pix = QPixmap(fn)
-        self.decode_preview.setPixmap(pix.scaled(300, 260, Qt.KeepAspectRatio))
+        self._orig_decode_pixmap = pix
+        self.update_decode_preview()
 
-        text = self.decode_file(fn)
-        if text:
-            self.show_decode_text(text, src="解析图片")
-        else:
-            self.decode_text.setText("未识别到二维码")
+        texts = self.decode_file(fn)
+        text_str = ""
+        if texts is None:
+            return
+        for text in texts:
+            text_str += text+'\n'
+        if text_str:
+            self.show_decode_text(text_str, src="解析图片")
+
+
 
     def decode_file(self, fn):
         img = cv2.imdecode(np.fromfile(fn, dtype=np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return None
-        text, pts, _ = self.detector.detectAndDecode(img)
-        return text or None
+
+        # 尝试多二维码识别
+        return self.detect_all_selector(img,"解析图片",self.config["detect_all_plus"])
+        # ok, texts, pts, _ = self.detector.detectAndDecodeMulti(img)
+        # if ok and texts:
+        #     texts = [t for t in texts if t]
+        #     if texts:
+        #         # 多码：界面显示多行，但历史记录拆分保存
+        #         self.decode_text.setPlainText("\n".join(texts))
+        #         for t in texts:
+        #             self.add_history("解析图片", t)
+        #         return texts
+
+        # # 回退单二维码（兼容旧版 / 单码情况）
+        # text, _, _ = self.detector.detectAndDecode(img)
+        # return text or None
 
     # ==========================
     #         截屏识别
     # ==========================
     def start_capture(self):
+        # ⭐ 切换到“解析二维码”页签
+        self.tabs.setCurrentIndex(1)
+
         self.hide()
-        self.cap = CaptureScreen(self.on_capture)
+        self.cap = CaptureScreen(self.on_capture, self.on_capture_cancel)
         self.cap.show()
 
+    def on_capture_cancel(self):
+        self.show()
+
+    # ---------- on_capture：把 singleShot(0) 改成短延迟，保证窗口恢复并布局完成 ----------
     def on_capture(self, pixmap):
         self.show()
-        self.decode_preview.setPixmap(pixmap.scaled(300, 260, Qt.KeepAspectRatio))
+        self._orig_decode_pixmap = pixmap
+        # 延迟一点再更新预览，避免窗口刚 show 导致 decode_preview size = 0（或布局未完成）
+        QTimer.singleShot(100, self.update_decode_preview)
 
         img = self.qpixmap_to_cv(pixmap)
-        text, _, _ = self.detector.detectAndDecode(img)
 
-        if text:
-            self.show_decode_text(text, src="截屏识别")
+        # 多二维码识别
+        res = self.detect_all_selector(img, "截屏识别",self.config["detect_all_plus"])
+
+
+
+        # # 回退单二维码
+        # text, _, _ = self.detector.detectAndDecode(img)
+        # if text:
+        #     self.show_decode_text(text, src="截屏识别")
+        # else:
+        #     self.decode_text.setText("未识别到二维码")
+    def detect_all_selector(self, img,source, enablePlus):
+        if enablePlus:
+            return self.detect_all_plus(img,source)
         else:
-            self.decode_text.setText("未识别到二维码")
+            return self.detect_all(img,source)
+
+
+    def detect_all(self, img,source):
+        ok, texts, pts, _ = self.detector.detectAndDecodeMulti(img)
+        if ok and texts:
+            texts = [t for t in texts if t]
+            if texts:
+                self.decode_text.setPlainText("\n".join(texts))
+                for t in texts:
+                    self.add_history(source, t)
+                return texts
+
+        self.decode_text.setPlainText("未识别出二维码")
+        return None
+
+    def detect_all_plus(self, img, source):
+
+        result = self.qr_reader.detect_and_decode(image=img, is_bgr=True)
+
+        # detect_and_decode 返回的是 tuple[str|None, ...]
+        if not result:
+            self.decode_text.setPlainText("未识别出二维码")
+            return None
+
+        texts = [t.strip() for t in result if t]
+
+        if not texts:
+            self.decode_text.setPlainText("未识别出二维码")
+            return None
+
+        self.decode_text.setPlainText("\n".join(texts))
+        for t in texts:
+            self.add_history(source, t)
+
+        return texts
 
     def show_decode_text(self, text, src):
-        self.decode_text.setText(text)
 
-        # 修改：使用新格式添加历史记录
-        self.add_history(src, text)
+        self.decode_text.setText(text)
 
         if text.startswith("http"):
             self.decode_text.setStyleSheet("color:blue; text-decoration: underline;")
@@ -542,7 +872,7 @@ class QRApp(QWidget):
             tray_icon = QIcon(ico_path)
         else:
             # 兜底：使用 style() 但包装进 QIcon
-            tray_icon = QApplication.style().standardIcon(QStyle.SP_ComputerIcon)
+            tray_icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
             if isinstance(tray_icon, QIcon):
                 pass
             else:
@@ -575,19 +905,16 @@ class QRApp(QWidget):
         # 4) 设置托盘上下文菜单
         self.tray.setContextMenu(self.tray_menu)
 
-        # 5) 兼容性处理：部分 Windows 环境右键不弹出菜单，监听 activated 并手动弹出菜单
-        def on_tray_activated(reason):
-            if reason == QSystemTrayIcon.Context:
-                pos = QCursor.pos()
-                self.tray_menu.exec(pos)
-            elif reason == QSystemTrayIcon.Trigger:
-                self.show()
-
-        self._on_tray_activated = on_tray_activated
-        self.tray.activated.connect(self._on_tray_activated)
+        # 5) 设置双击托盘打开界面
+        self.tray.activated.connect(self.on_tray_activated)
 
         # 6) 显示托盘图标
         self.tray.show()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_main_window()
+
 
     def show_main_window(self):
         self.show()
@@ -610,7 +937,7 @@ class QRApp(QWidget):
         self.tray.showMessage(
             "二维码工具",
             "程序已最小化到系统托盘",
-            QSystemTrayIcon.Information,
+            QSystemTrayIcon.MessageIcon.Information,
             2000
         )
 
