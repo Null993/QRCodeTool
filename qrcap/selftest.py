@@ -23,7 +23,7 @@ def run_package_self_test() -> int:
         if enhancement_root() != executable_root:
             return 3
 
-    payload = "qrcap-v1.3-package-self-test"
+    payload = "qrcap-v1.4-package-self-test"
     qr = qrcode.QRCode(box_size=6, border=4)
     qr.add_data(payload)
     qr.make()

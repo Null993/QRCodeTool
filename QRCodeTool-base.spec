@@ -159,5 +159,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="QRCodeTool-v1.3-base",
+    name="QRCodeTool-v1.4-base",
 )

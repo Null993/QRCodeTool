@@ -88,10 +88,12 @@ def extract_first_url(text: str) -> str | None:
     return url
 
 
-def image_path_from_mime_data(mime_data) -> str | None:
-    """Return the first supported local image path in a drop payload."""
+def image_paths_from_mime_data(mime_data) -> tuple[str, ...]:
+    """Return all supported local image paths in a drop payload."""
     if mime_data is None or not mime_data.hasUrls():
-        return None
+        return ()
+    paths = []
+    seen = set()
     for url in mime_data.urls():
         if not url.isLocalFile():
             continue
@@ -101,8 +103,17 @@ def image_path_from_mime_data(mime_data) -> str | None:
             and os.path.splitext(path)[1].lower()
             in SUPPORTED_IMAGE_SUFFIXES
         ):
-            return path
-    return None
+            normalized = os.path.normcase(os.path.abspath(path))
+            if normalized not in seen:
+                seen.add(normalized)
+                paths.append(path)
+    return tuple(paths)
+
+
+def image_path_from_mime_data(mime_data) -> str | None:
+    """Return the first supported image path for compatibility."""
+    paths = image_paths_from_mime_data(mime_data)
+    return paths[0] if paths else None
 
 
 def render_decode_message_html(
@@ -141,6 +152,71 @@ def render_decode_results_html(texts, theme: str) -> str:
             f'{content}</div>'
         )
     return "".join(cards)
+
+
+def render_batch_decode_results_html(records, theme: str, cancelled=False) -> str:
+    """Render per-file results and a compact batch summary."""
+    colors = theme_colors(theme)
+    records = tuple(records)
+    recognized = sum(bool(record["texts"]) for record in records)
+    failed = sum(bool(record["error"]) for record in records)
+    missed = len(records) - recognized - failed
+    value_count = sum(len(record["texts"]) for record in records)
+    state_text = "批量识别已停止" if cancelled else "批量识别完成"
+    summary = (
+        f"{state_text}：已处理 {len(records)} 张，"
+        f"成功 {recognized} 张，未识别 {missed} 张，"
+        f"失败 {failed} 张，共得到 {value_count} 条结果。"
+    )
+    blocks = [
+        '<div style="font-weight:600;margin-bottom:12px;'
+        f'color:{colors["text"]};">{html.escape(summary)}</div>'
+    ]
+
+    for index, record in enumerate(records, 1):
+        path = str(record["path"])
+        filename = os.path.basename(path) or path
+        blocks.append(
+            '<div style="margin:10px 0 5px 0;'
+            f'color:{colors["text"]};">'
+            f'<b>{index}. {html.escape(filename)}</b>'
+            f'<span style="color:{colors["muted"]};"> | '
+            f'{html.escape(path)}</span></div>'
+        )
+
+        error = str(record["error"] or "")
+        texts = tuple(record["texts"])
+        if error:
+            blocks.append(
+                f'<div style="color:{colors["error"]};">'
+                f'识别失败：{html.escape(error)}</div>'
+            )
+        elif not texts:
+            blocks.append(
+                f'<div style="color:{colors["muted"]};">'
+                "未识别出二维码或受支持的条码</div>"
+            )
+        else:
+            for text in texts:
+                safe_text = html.escape(text).replace("\n", "<br>")
+                url = extract_first_url(text)
+                content = safe_text
+                if url:
+                    content = (
+                        f'<a href="{html.escape(url, quote=True)}" '
+                        f'style="color:{colors["link"]};'
+                        f'text-decoration:none;">{safe_text}</a>'
+                    )
+                blocks.append(
+                    '<div style="margin:4px 0 4px 12px;'
+                    f'color:{colors["text"]};word-wrap:break-word;">'
+                    f'{content}</div>'
+                )
+        blocks.append(
+            f'<div style="border-bottom:1px solid {colors["border"]};'
+            'margin-top:10px;"></div>'
+        )
+    return "".join(blocks)
 
 
 def window_display_mode(widget) -> str:
@@ -195,7 +271,7 @@ class QRApp(QWidget):
         self.hotkey_handle = None
         self.setAcceptDrops(True)
         self.setObjectName("appRoot")
-        self.setWindowTitle("QRCodeTool · 二维码工具 v1.3")
+        self.setWindowTitle("QRCodeTool · 二维码工具 v1.4")
         self.setMinimumSize(820, 560)
         self.resize(1080, 720)
         self.config = self.load_config()
@@ -212,6 +288,7 @@ class QRApp(QWidget):
         self._decode_busy = False
         self._decode_request_id = 0
         self._decode_render_state = None
+        self._batch_decode_state = None
         configured_enhancement_root = self.config.get("enhancement_dir")
         self.enhancement_manager = EnhancementManager(
             configured_enhancement_root or None
@@ -246,7 +323,7 @@ class QRApp(QWidget):
         brand_title = QLabel("QRCodeTool")
         brand_title.setObjectName("brandTitle")
         brand_text.addWidget(brand_title)
-        brand_version = QLabel("v1.3 · Null993")
+        brand_version = QLabel("v1.4 · Null993")
         brand_version.setObjectName("brandVersion")
         brand_text.addWidget(brand_version)
         brand.addLayout(brand_text)
@@ -538,11 +615,15 @@ class QRApp(QWidget):
                 QEvent.Type.Drop,
             )
         ):
-            image_path = image_path_from_mime_data(event.mimeData())
-            if image_path and not self._decode_busy:
+            image_paths = image_paths_from_mime_data(event.mimeData())
+            if (
+                image_paths
+                and not self._decode_busy
+                and self._batch_decode_state is None
+            ):
                 event.acceptProposedAction()
                 if event_type == QEvent.Type.Drop:
-                    self.open_decode_path(image_path)
+                    self.open_decode_paths(image_paths)
                 return True
 
         if (
@@ -604,11 +685,22 @@ class QRApp(QWidget):
 
     def add_history(self, source, content):
         """添加历史记录，分开存储来源和内容"""
-        self.history.append({
-            "source": source,
-            "content": content,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
+        self.add_history_entries(((source, content),))
+
+    def add_history_entries(self, entries):
+        """批量写入历史记录，避免重复刷新列表和磁盘文件。"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_items = [
+            {
+                "source": source,
+                "content": content,
+                "time": timestamp,
+            }
+            for source, content in entries
+        ]
+        if not new_items:
+            return
+        self.history.extend(new_items)
         self.save_history()
         self.refresh_history()
 
@@ -1008,20 +1100,30 @@ class QRApp(QWidget):
         v.setSpacing(12)
         v.addWidget(PageHeader(
             "识别二维码",
-            "从图片或任意显示器截取区域，程序会自动选择合适的识别方式。",
+            "支持单张、多张及文件夹批量识别，也可从任意显示器截取区域。",
         ))
 
         actions_card = Card(compact=True)
         actions = QHBoxLayout()
         actions.setSpacing(12)
-        self.decode_file_btn = QPushButton("选择图片解析")
+        self.decode_file_btn = QPushButton("选择图片")
         self.decode_file_btn.clicked.connect(self.open_decode)
         actions.addWidget(self.decode_file_btn)
+
+        self.decode_folder_btn = QPushButton("选择文件夹")
+        self.decode_folder_btn.clicked.connect(self.open_decode_folder)
+        actions.addWidget(self.decode_folder_btn)
 
         self.capture_btn = QPushButton("截屏识别")
         self.capture_btn.setProperty("primary", True)
         self.capture_btn.clicked.connect(self.start_capture)
         actions.addWidget(self.capture_btn)
+
+        self.cancel_batch_btn = QPushButton("停止批量")
+        self.cancel_batch_btn.setProperty("danger", True)
+        self.cancel_batch_btn.clicked.connect(self.cancel_batch_decode)
+        self.cancel_batch_btn.setVisible(False)
+        actions.addWidget(self.cancel_batch_btn)
         actions.addStretch(1)
         actions_card.body.addLayout(actions)
         v.addWidget(actions_card)
@@ -1032,7 +1134,7 @@ class QRApp(QWidget):
         preview_head.addStretch(1)
         preview_card.body.addLayout(preview_head)
         self.decode_preview = StablePixmapLabel(
-            "选择图片、拖入图片或截取屏幕区域后，将在这里显示预览",
+            "选择或拖入一张/多张图片，也可选择文件夹或截取屏幕区域",
             preferred_size=QSize(200, 90),
         )
         self.decode_preview.setObjectName("decodePreview")
@@ -1106,6 +1208,29 @@ class QRApp(QWidget):
         )
         QTimer.singleShot(0, self.update_decode_text_size)
 
+    def show_batch_decode_results(self, records, cancelled=False):
+        values = tuple(
+            {
+                "path": str(record["path"]),
+                "texts": tuple(record["texts"]),
+                "error": str(record["error"] or ""),
+            }
+            for record in records
+        )
+        self._decode_render_state = (
+            "batch_results",
+            values,
+            bool(cancelled),
+        )
+        self.decode_text.setHtml(
+            render_batch_decode_results_html(
+                values,
+                self.theme,
+                cancelled=cancelled,
+            )
+        )
+        QTimer.singleShot(0, self.update_decode_text_size)
+
     def refresh_decode_theme(self):
         if not hasattr(self, "decode_text") or not self._decode_render_state:
             return
@@ -1122,6 +1247,14 @@ class QRApp(QWidget):
         elif kind == "results":
             self.decode_text.setHtml(
                 render_decode_results_html(payload[0], self.theme)
+            )
+        elif kind == "batch_results":
+            self.decode_text.setHtml(
+                render_batch_decode_results_html(
+                    payload[0],
+                    self.theme,
+                    cancelled=payload[1],
+                )
             )
         elif kind == "plain":
             self.decode_text.setPlainText(payload[0])
@@ -1149,20 +1282,80 @@ class QRApp(QWidget):
         QApplication.clipboard().setText(text)
 
     def open_decode(self):
-        if self._decode_busy:
+        if self._decode_busy or self._batch_decode_state is not None:
             return
 
-        fn, _ = QFileDialog.getOpenFileName(self, "选择图片", filter="Images (*.png *.jpg *.jpeg)")
-        if not fn:
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择一张或多张图片",
+            filter="图片 (*.png *.jpg *.jpeg *.bmp)",
+        )
+        if not filenames:
+            return
+        self.open_decode_paths(filenames)
+
+    def open_decode_folder(self):
+        if self._decode_busy or self._batch_decode_state is not None:
             return
 
-        self.open_decode_path(fn)
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "选择包含二维码图片的文件夹",
+        )
+        if not directory:
+            return
+
+        filenames = []
+        for root, directories, files in os.walk(directory):
+            directories.sort(key=str.casefold)
+            for filename in sorted(files, key=str.casefold):
+                if os.path.splitext(filename)[1].lower() in SUPPORTED_IMAGE_SUFFIXES:
+                    filenames.append(os.path.join(root, filename))
+
+        if not filenames:
+            QMessageBox.information(
+                self,
+                "没有可识别的图片",
+                "所选文件夹及其子文件夹中没有 PNG、JPG、JPEG 或 BMP 图片。",
+            )
+            return
+        self.open_decode_paths(filenames)
 
     def open_decode_path(self, filename: str) -> bool:
         """Load an image selected from a dialog or dropped on the window."""
-        if self._decode_busy:
+        return self.open_decode_paths((filename,))
+
+    def open_decode_paths(self, filenames) -> bool:
+        """Start a single-image or sequential batch recognition task."""
+        if self._decode_busy or self._batch_decode_state is not None:
             return False
 
+        paths = []
+        seen = set()
+        for filename in filenames:
+            path = os.path.abspath(os.fspath(filename))
+            normalized = os.path.normcase(path)
+            if (
+                normalized in seen
+                or not os.path.isfile(path)
+                or os.path.splitext(path)[1].lower()
+                not in SUPPORTED_IMAGE_SUFFIXES
+            ):
+                continue
+            seen.add(normalized)
+            paths.append(path)
+
+        if not paths:
+            QMessageBox.warning(
+                self,
+                "无法读取图片",
+                "没有找到受支持且可读取的图片文件。",
+            )
+            return False
+        if len(paths) > 1:
+            return self.start_batch_decode(paths)
+
+        filename = paths[0]
         pix = QPixmap(filename)
         if pix.isNull():
             QMessageBox.warning(
@@ -1178,11 +1371,112 @@ class QRApp(QWidget):
         self.start_decode(pix.toImage(), "解析图片")
         return True
 
+    def start_batch_decode(self, paths) -> bool:
+        """Decode many images one-by-one without loading them all into memory."""
+        if self._decode_busy or self._batch_decode_state is not None:
+            return False
+
+        self.navigation.setCurrentRow(1)
+        self._batch_decode_state = {
+            "paths": tuple(paths),
+            "next_index": 0,
+            "current_path": "",
+            "records": [],
+            "history_entries": [],
+            "cancelled": False,
+        }
+        self.set_decode_controls_enabled(False)
+        self.cancel_batch_btn.setVisible(True)
+        self.show_decode_message(
+            f"准备批量识别，共 {len(paths)} 张图片…"
+        )
+        QTimer.singleShot(0, self._start_next_batch_image)
+        return True
+
+    def _start_next_batch_image(self) -> None:
+        state = self._batch_decode_state
+        if state is None:
+            return
+        if state["cancelled"] or state["next_index"] >= len(state["paths"]):
+            self._finish_batch_decode()
+            return
+
+        while state["next_index"] < len(state["paths"]):
+            path = state["paths"][state["next_index"]]
+            state["next_index"] += 1
+            state["current_path"] = path
+
+            pixmap = QPixmap(path)
+            if pixmap.isNull():
+                state["records"].append({
+                    "path": path,
+                    "texts": (),
+                    "error": "图片文件无法读取或已经损坏",
+                })
+                if state["cancelled"]:
+                    self._finish_batch_decode()
+                    return
+                continue
+
+            self._orig_decode_pixmap = pixmap
+            self.update_decode_preview()
+            position = state["next_index"]
+            total = len(state["paths"])
+            filename = os.path.basename(path)
+            self.show_decode_message(
+                f"正在识别 {position}/{total}：{filename}"
+            )
+            if not self.start_decode(
+                pixmap.toImage(),
+                f"批量识别 · {filename}",
+            ):
+                state["records"].append({
+                    "path": path,
+                    "texts": (),
+                    "error": "无法启动后台识别任务",
+                })
+                continue
+            return
+
+        self._finish_batch_decode()
+
+    def cancel_batch_decode(self) -> None:
+        state = self._batch_decode_state
+        if state is None:
+            return
+        state["cancelled"] = True
+        self.cancel_batch_btn.setEnabled(False)
+        if self._decode_busy:
+            self.show_decode_message("正在停止，当前图片识别完成后结束…")
+        else:
+            self._finish_batch_decode()
+
+    def _finish_batch_decode(self) -> None:
+        state = self._batch_decode_state
+        if state is None:
+            return
+
+        self._batch_decode_state = None
+        self._decode_busy = False
+        self.cancel_batch_btn.setVisible(False)
+        self.cancel_batch_btn.setEnabled(True)
+        self.set_decode_controls_enabled(True)
+        self.add_history_entries(state["history_entries"])
+        self.show_batch_decode_results(
+            state["records"],
+            cancelled=state["cancelled"],
+        )
+
     # ==========================
     #         截屏识别
     # ==========================
     def start_capture(self):
-        if self._decode_busy or self._capture_pending or self.cap is not None:
+        if (
+            self._decode_busy
+            or self._batch_decode_state is not None
+            or self._capture_pending
+            or self.cap is not None
+        ):
             return
 
         self._capture_window_mode = window_display_mode(self)
@@ -1228,10 +1522,17 @@ class QRApp(QWidget):
         )
 
 
+    def set_decode_controls_enabled(self, enabled: bool) -> None:
+        self.decode_file_btn.setEnabled(enabled)
+        self.decode_folder_btn.setEnabled(enabled)
+        self.capture_btn.setEnabled(enabled)
+        if hasattr(self, "cap_act"):
+            self.cap_act.setEnabled(enabled)
+
     def start_decode(self, image, source):
         """启动固定的自动识别流水线，所有耗时操作均在后台线程执行。"""
         if self._decode_busy:
-            return
+            return False
 
         self._decode_busy = True
         status = (
@@ -1239,17 +1540,33 @@ class QRApp(QWidget):
             if self.recognition.preload_running
             else "正在快速识别…"
         )
-        self.show_decode_message(status)
-        self.decode_file_btn.setEnabled(False)
-        self.capture_btn.setEnabled(False)
-        if hasattr(self, "cap_act"):
-            self.cap_act.setEnabled(False)
+        state = self._batch_decode_state
+        if state is None:
+            self.show_decode_message(status)
+        else:
+            position = state["next_index"]
+            total = len(state["paths"])
+            filename = os.path.basename(state["current_path"])
+            self.show_decode_message(
+                f"正在识别 {position}/{total}：{filename}\n{status}"
+            )
+        self.set_decode_controls_enabled(False)
 
         self._decode_request_id = self.recognition.submit(image, source)
+        return True
 
     def on_decode_progress(self, request_id, message):
         if request_id == self._decode_request_id:
-            self.show_decode_message(message)
+            state = self._batch_decode_state
+            if state is None:
+                self.show_decode_message(message)
+            else:
+                position = state["next_index"]
+                total = len(state["paths"])
+                filename = os.path.basename(state["current_path"])
+                self.show_decode_message(
+                    f"正在识别 {position}/{total}：{filename}\n{message}"
+                )
 
     def on_decode_finished(self, request_id, texts, source, error):
         self.recognition.discard_request(request_id)
@@ -1257,10 +1574,23 @@ class QRApp(QWidget):
             return
 
         self._decode_busy = False
-        self.decode_file_btn.setEnabled(True)
-        self.capture_btn.setEnabled(True)
-        if hasattr(self, "cap_act"):
-            self.cap_act.setEnabled(True)
+        state = self._batch_decode_state
+        if state is not None:
+            values = self.recognition.unique_texts(texts or ())
+            path = state["current_path"]
+            state["records"].append({
+                "path": path,
+                "texts": values if not error else (),
+                "error": error,
+            })
+            if not error:
+                state["history_entries"].extend(
+                    (source, text) for text in values
+                )
+            QTimer.singleShot(0, self._start_next_batch_image)
+            return
+
+        self.set_decode_controls_enabled(True)
 
         if error:
             self.show_decode_message(f"识别失败：{error}", "error")
