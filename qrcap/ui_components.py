@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -51,6 +52,31 @@ class PageHeader(QWidget):
         subtitle_label.setObjectName("pageSubtitle")
         subtitle_label.setWordWrap(True)
         layout.addWidget(subtitle_label)
+
+
+class StablePixmapLabel(QLabel):
+    """A preview label whose pixmap cannot enlarge its parent layout."""
+
+    def __init__(
+        self,
+        text: str = "",
+        parent: QWidget | None = None,
+        *,
+        preferred_size: QSize = QSize(200, 150),
+    ) -> None:
+        super().__init__(text, parent)
+        self._preferred_size = QSize(preferred_size)
+        self.setMinimumSize(self._preferred_size)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Ignored,
+        )
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._preferred_size)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self._preferred_size)
 
 
 def section_label(text: str) -> QLabel:

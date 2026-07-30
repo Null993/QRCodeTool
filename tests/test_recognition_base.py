@@ -37,6 +37,32 @@ def make_qr_image(text: str) -> QImage:
 
 
 class BaseRecognitionTests(unittest.TestCase):
+    def test_zbar_shift_jis_mojibake_is_repaired(self):
+        self.assertEqual(
+            "艰苦困难",
+            RecognitionService._repair_pyzbar_text(
+                "濶ｰ闍ｦ蝗ｰ髫ｾ"
+            ),
+        )
+
+    def test_utf8_chinese_qr_returns_one_clean_result(self):
+        payload = "艰苦困难"
+        with tempfile.TemporaryDirectory() as temp:
+            manager = EnhancementManager(Path(temp))
+            service = RecognitionService(manager)
+            image = make_qr_image(payload)
+
+            try:
+                result = service._decode_with_fast_decoders(
+                    image,
+                    include_all=True,
+                )
+            finally:
+                service.shutdown()
+                manager.deactivate_runtime()
+
+        self.assertEqual([payload], result)
+
     def test_invisible_bom_and_whitespace_are_deduplicated(self):
         values = RecognitionService.unique_texts(
             (

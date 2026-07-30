@@ -17,11 +17,13 @@ from .resources import resource_path
 from .theme import (
     apply_native_titlebar_theme,
     apply_theme,
+    detect_system_theme,
     theme_colors,
 )
 from .ui_components import (
     Card,
     PageHeader,
+    StablePixmapLabel,
     helper_label,
     navigation_icon,
     section_label,
@@ -112,6 +114,14 @@ def restore_window_display_mode(widget, mode: str) -> None:
         widget.showNormal()
 
 
+def resolve_initial_theme(config: dict) -> str:
+    """Use an explicit preference or fall back to the Windows theme."""
+    saved_theme = config.get("theme")
+    if saved_theme in ("light", "dark"):
+        return saved_theme
+    return detect_system_theme()
+
+
 # ---------------------------
 # GUI 相关导入
 # ---------------------------
@@ -142,7 +152,7 @@ class QRApp(QWidget):
         self.config = self.load_config()
         self.theme = apply_theme(
             QApplication.instance(),
-            self.config.get("theme", "light"),
+            resolve_initial_theme(self.config),
         )
 
         self.cap = None
@@ -283,15 +293,14 @@ class QRApp(QWidget):
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE):
-            return {"hotkey": "", "theme": "light"}
+            return {"hotkey": ""}
         try:
             config = json.load(open(CONFIG_FILE, "r", encoding="utf8"))
             config.pop("detect_all_plus", None)
             config.setdefault("hotkey", "")
-            config.setdefault("theme", "light")
             return config
         except:
-            return {"hotkey": "", "theme": "light"}
+            return {"hotkey": ""}
 
     def save_config(self):
         self.config.pop("detect_all_plus", None)
@@ -896,15 +905,12 @@ class QRApp(QWidget):
         preview_head.addWidget(section_label("图片预览"))
         preview_head.addStretch(1)
         preview_card.body.addLayout(preview_head)
-        self.decode_preview = QLabel("选择图片或截取屏幕区域后，将在这里显示预览")
+        self.decode_preview = StablePixmapLabel(
+            "选择图片或截取屏幕区域后，将在这里显示预览"
+        )
         self.decode_preview.setObjectName("decodePreview")
         self.decode_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.decode_preview.setScaledContents(False)
-        self.decode_preview.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Expanding
-        )
-        self.decode_preview.setMinimumSize(200, 150)
         preview_card.body.addWidget(self.decode_preview, stretch=1)
         v.addWidget(preview_card, stretch=1)
 

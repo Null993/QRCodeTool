@@ -38,6 +38,44 @@ def theme_colors(theme: str) -> dict[str, str]:
     return DARK_COLORS if theme == "dark" else LIGHT_COLORS
 
 
+def _windows_apps_use_light_theme() -> int:
+    import winreg
+
+    key_path = (
+        r"Software\Microsoft\Windows\CurrentVersion"
+        r"\Themes\Personalize"
+    )
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        key_path,
+    ) as key:
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+    return int(value)
+
+
+def detect_system_theme() -> str:
+    """Read the Windows application theme, with a safe Qt fallback."""
+    if sys.platform == "win32":
+        try:
+            return (
+                "light"
+                if _windows_apps_use_light_theme()
+                else "dark"
+            )
+        except (OSError, TypeError, ValueError):
+            pass
+
+    application = QApplication.instance()
+    if application is not None:
+        try:
+            scheme = application.styleHints().colorScheme()
+            if getattr(scheme, "name", "") == "Dark":
+                return "dark"
+        except (AttributeError, TypeError):
+            pass
+    return "light"
+
+
 LIGHT_STYLESHEET = """
 QWidget {
     color: #172033;

@@ -447,9 +447,20 @@ class RecognitionService(QObject):
             ZBarSymbol.EAN8,
         )
         return self._unique_texts(
-            self._decode_bytes(result.data)
+            self._repair_pyzbar_text(
+                self._decode_bytes(result.data)
+            )
             for result in decode(decode_image, symbols=symbols)
         )
+
+    @staticmethod
+    def _repair_pyzbar_text(text: str) -> str:
+        """Undo ZBar's UTF-8-as-Shift-JIS conversion when reversible."""
+        try:
+            repaired = text.encode("shift-jis").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return text
+        return repaired or text
 
     @staticmethod
     def _decode_bytes(data) -> str:
