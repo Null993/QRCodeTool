@@ -6,4 +6,13 @@ history.json
 icon.png
 main.spec
 QRCodeTool.spec
+__pycache__/
+*.py[cod]
+/.enhancement-test/
+/.cache/
+/active/
+/artifacts/
+/build-base/
+/packages/
+/release/
 back.py

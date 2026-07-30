@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Only required on the machine that builds the optional enhancement ZIP.
+qreader==3.16
+qrdet==2.5
+torch==2.9.1
+torchvision==0.24.1
+ultralytics==8.3.235
+packaging
