@@ -57,14 +57,30 @@ class RecognitionService(QObject):
         self._preload_errors = []
 
         futures = [self.decode_executor.submit(self._preload_fast_engine)]
-        if self.enhancement_manager.inspect().can_load:
-            model_future = self.model_executor.submit(self._preload_model_engine)
-            self._model_preload_future = model_future
-            futures.append(model_future)
-
         self._preload_pending = len(futures)
         for future in futures:
             future.add_done_callback(self._notify_preload_component_finished)
+
+    def start_optional_model_preload(self) -> None:
+        """Warm the optional model only after the main UI has been idle."""
+        if self.qr_reader is not None:
+            return
+        if self._model_preload_future is not None:
+            return
+        if not self.enhancement_manager.inspect().can_load:
+            return
+
+        self.preload_running = True
+        future = self.model_executor.submit(self._preload_model_engine)
+        self._model_preload_future = future
+        future.add_done_callback(self._notify_optional_model_finished)
+
+    @property
+    def optional_model_preload_started(self) -> bool:
+        return (
+            self.qr_reader is not None
+            or self._model_preload_future is not None
+        )
 
     def reload_enhancement(self) -> EnhancementStatus:
         status = self.enhancement_manager.activate_runtime()

@@ -17,6 +17,7 @@ from .resources import resource_path
 from .theme import (
     apply_native_titlebar_theme,
     apply_theme,
+    detect_system_tray_theme,
     detect_system_theme,
     theme_colors,
 )
@@ -24,9 +25,12 @@ from .ui_components import (
     Card,
     PageHeader,
     StablePixmapLabel,
+    ThemedCheckBox,
+    ThemedCheckItemDelegate,
     helper_label,
     navigation_icon,
     section_label,
+    themed_tray_icon,
 )
 
 warnings.filterwarnings("ignore", message="Double decoding failed")
@@ -34,6 +38,33 @@ warnings.filterwarnings("ignore", message="Double decoding failed")
 # ---------- 常量 ----------
 HISTORY_FILE = "history.json"
 CONFIG_FILE = "config.json"
+SUPPORTED_IMAGE_SUFFIXES = frozenset({
+    ".bmp",
+    ".jpeg",
+    ".jpg",
+    ".png",
+})
+
+
+def notify_shell_executable_updated() -> None:
+    """Ask Windows Explorer to discard a stale icon for this executable."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import ctypes
+
+        shell_change_update_item = 0x00002000
+        shell_notify_path_w = 0x0005
+        shell_notify_flush = 0x1000
+        ctypes.windll.shell32.SHChangeNotify(
+            shell_change_update_item,
+            shell_notify_path_w | shell_notify_flush,
+            str(sys.executable),
+            None,
+        )
+    except (AttributeError, OSError):
+        pass
+
 
 # ---------- 正则：识别文本中的第一个 URL（支持不带 scheme 的裸域名 / www） ----------
 _url_re = re.compile(
@@ -55,6 +86,23 @@ def extract_first_url(text: str) -> str | None:
     if not re.match(r"^https?://", url, re.I):
         url = "http://" + url
     return url
+
+
+def image_path_from_mime_data(mime_data) -> str | None:
+    """Return the first supported local image path in a drop payload."""
+    if mime_data is None or not mime_data.hasUrls():
+        return None
+    for url in mime_data.urls():
+        if not url.isLocalFile():
+            continue
+        path = url.toLocalFile()
+        if (
+            os.path.isfile(path)
+            and os.path.splitext(path)[1].lower()
+            in SUPPORTED_IMAGE_SUFFIXES
+        ):
+            return path
+    return None
 
 
 def render_decode_message_html(
@@ -127,12 +175,12 @@ def resolve_initial_theme(config: dict) -> str:
 # ---------------------------
 from PySide6.QtWidgets import (
     QApplication, QWidget, QStackedWidget, QVBoxLayout, QLabel, QPushButton,
-    QTextEdit, QFileDialog, QLineEdit, QSystemTrayIcon, QStyle, QMenu,
-    QListWidget, QListWidgetItem, QMessageBox, QHBoxLayout, QCheckBox,
+    QTextEdit, QFileDialog, QLineEdit, QSystemTrayIcon, QMenu,
+    QListWidget, QListWidgetItem, QMessageBox, QHBoxLayout,
     QSizePolicy, QFrame
 )
-from PySide6.QtGui import QImage, QPainter, QPixmap, QAction, QIcon
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QImage, QPainter, QPixmap, QAction
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 
 # ================================
 #           主程序
@@ -145,6 +193,7 @@ class QRApp(QWidget):
 
         self.chk_all = None
         self.hotkey_handle = None
+        self.setAcceptDrops(True)
         self.setObjectName("appRoot")
         self.setWindowTitle("QRCodeTool · 二维码工具 v1.3")
         self.setMinimumSize(820, 560)
@@ -154,6 +203,8 @@ class QRApp(QWidget):
             QApplication.instance(),
             resolve_initial_theme(self.config),
         )
+        self.update_system_icons()
+        QApplication.instance().installEventFilter(self)
 
         self.cap = None
         self._capture_pending = False
@@ -214,7 +265,8 @@ class QRApp(QWidget):
         self.navigation.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.navigation.setFixedHeight(252)
+        self.navigation.setSpacing(2)
+        self.navigation.setUniformItemSizes(True)
         for icon_name, label in (
             ("generate", "生成二维码"),
             ("scan", "识别二维码"),
@@ -222,9 +274,14 @@ class QRApp(QWidget):
             ("hotkey", "快捷键设置"),
             ("enhancement", "增强能力"),
         ):
-            self.navigation.addItem(
-                QListWidgetItem(navigation_icon(icon_name), label)
-            )
+            item = QListWidgetItem(navigation_icon(icon_name), label)
+            item.setSizeHint(QSize(0, 44))
+            self.navigation.addItem(item)
+        navigation_height = (
+            self.navigation.count()
+            * (44 + 2 * self.navigation.spacing())
+        )
+        self.navigation.setFixedHeight(navigation_height)
         sidebar_layout.addWidget(self.navigation)
         sidebar_layout.addStretch(1)
 
@@ -283,13 +340,23 @@ class QRApp(QWidget):
         self.navigation.setCurrentRow(0)
         self.update_theme_button()
         self.update_enhancement_summary(self.enhancement_manager.inspect())
+        layout.activate()
+        self.enhancement_page.prewarm_layout()
         QTimer.singleShot(0, self.update_native_titlebar)
+        QTimer.singleShot(0, notify_shell_executable_updated)
 
         self.hotkey_triggered.connect(self.start_capture)
 
         self.start_hotkey_listener()
         self.init_tray()
-        QTimer.singleShot(800, self.recognition.start_background_preload)
+        QTimer.singleShot(1200, self.recognition.start_background_preload)
+        self._model_preload_idle_timer = QTimer(self)
+        self._model_preload_idle_timer.setSingleShot(True)
+        self._model_preload_idle_timer.setInterval(5000)
+        self._model_preload_idle_timer.timeout.connect(
+            self.recognition.start_optional_model_preload
+        )
+        self._model_preload_idle_timer.start()
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE):
@@ -316,6 +383,7 @@ class QRApp(QWidget):
         self.enhancement_page.refresh_status()
         self.refresh_decode_theme()
         self.update_native_titlebar()
+        self.update_system_icons()
         QTimer.singleShot(0, self.update_native_titlebar)
 
     def update_theme_button(self):
@@ -435,6 +503,7 @@ class QRApp(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self.update_qr_preview()
         self.update_decode_preview()
 
     def on_page_changed(self, index: int):
@@ -445,6 +514,47 @@ class QRApp(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self.update_native_titlebar()
+
+    def eventFilter(self, watched, event):
+        event_type = event.type()
+        if (
+            hasattr(self, "_model_preload_idle_timer")
+            and not self.recognition.optional_model_preload_started
+            and event_type in (
+                QEvent.Type.KeyPress,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.TouchBegin,
+                QEvent.Type.Wheel,
+            )
+        ):
+            self._model_preload_idle_timer.start()
+
+        if (
+            isinstance(watched, QWidget)
+            and (watched is self or self.isAncestorOf(watched))
+            and event_type in (
+                QEvent.Type.DragEnter,
+                QEvent.Type.DragMove,
+                QEvent.Type.Drop,
+            )
+        ):
+            image_path = image_path_from_mime_data(event.mimeData())
+            if image_path and not self._decode_busy:
+                event.acceptProposedAction()
+                if event_type == QEvent.Type.Drop:
+                    self.open_decode_path(image_path)
+                return True
+
+        if (
+            isinstance(watched, QMessageBox)
+            and event_type in (
+                QEvent.Type.Polish,
+                QEvent.Type.Show,
+            )
+            and hasattr(self, "_system_icon")
+        ):
+            watched.setWindowIcon(self._system_icon)
+        return super().eventFilter(watched, event)
 
     # ==========================
     #        历史记录
@@ -515,7 +625,7 @@ class QRApp(QWidget):
 
         card = Card()
         h = QHBoxLayout()
-        self.chk_all = QCheckBox("全选")
+        self.chk_all = ThemedCheckBox("全选")
         # 允许显示部分选中状态（程序可以显示 PartiallyChecked）
         self.chk_all.setTristate(True)
         # 使用 clicked(bool) —— 只在用户点击时触发（区分程序性修改）
@@ -535,6 +645,7 @@ class QRApp(QWidget):
 
         self.list = QListWidget()
         self.list.setObjectName("historyList")
+        self.list.setItemDelegate(ThemedCheckItemDelegate(self.list))
         self.list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
@@ -798,7 +909,7 @@ class QRApp(QWidget):
         ))
         self.input_text = QTextEdit()
         self.input_text.setPlaceholderText("在这里输入需要编码的内容…")
-        self.input_text.setMinimumHeight(260)
+        self.input_text.setMinimumHeight(160)
         input_card.body.addWidget(self.input_text, stretch=1)
 
         btn = QPushButton("生成二维码")
@@ -809,10 +920,12 @@ class QRApp(QWidget):
 
         preview_card = Card()
         preview_card.body.addWidget(section_label("实时预览"))
-        self.qr_label = QLabel("输入内容并点击“生成二维码”")
+        self.qr_label = StablePixmapLabel(
+            "输入内容并点击“生成二维码”",
+            preferred_size=QSize(180, 180),
+        )
         self.qr_label.setObjectName("qrPreview")
         self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.qr_label.setMinimumSize(300, 300)
         preview_card.body.addWidget(self.qr_label, stretch=1)
 
         self.save_qr_btn = QPushButton("保存为 PNG")
@@ -857,8 +970,7 @@ class QRApp(QWidget):
                     )
         painter.end()
 
-        pix = QPixmap.fromImage(self.qr_image)
-        self.qr_label.setPixmap(pix.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio))
+        self.update_qr_preview()
         self.save_qr_btn.setEnabled(True)
 
         # 修改：使用新格式添加历史记录
@@ -870,6 +982,20 @@ class QRApp(QWidget):
         fn, _ = QFileDialog.getSaveFileName(self, "保存二维码", filter="PNG (*.png)")
         if fn:
             self.qr_image.save(fn, "PNG")
+
+    def update_qr_preview(self):
+        if not hasattr(self, "qr_image") or not hasattr(self, "qr_label"):
+            return
+        if self.qr_label.width() <= 0 or self.qr_label.height() <= 0:
+            return
+        pixmap = QPixmap.fromImage(self.qr_image)
+        self.qr_label.setPixmap(
+            pixmap.scaled(
+                self.qr_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+        )
 
     # ==========================
     #        解析二维码
@@ -906,7 +1032,8 @@ class QRApp(QWidget):
         preview_head.addStretch(1)
         preview_card.body.addLayout(preview_head)
         self.decode_preview = StablePixmapLabel(
-            "选择图片或截取屏幕区域后，将在这里显示预览"
+            "选择图片、拖入图片或截取屏幕区域后，将在这里显示预览",
+            preferred_size=QSize(200, 90),
         )
         self.decode_preview.setObjectName("decodePreview")
         self.decode_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -925,18 +1052,22 @@ class QRApp(QWidget):
         self.decode_text.setReadOnly(True)
         self.decode_text.setPlaceholderText("识别结果将在这里显示")
         self.decode_text.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred  # Preferred: 根据内容确定合适大小
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
         )
-        self.decode_text.setMaximumHeight(300)  # 设置最大高度限制
+        self.decode_text.setMinimumHeight(64)
+        self.decode_text.setMaximumHeight(240)
+        self.decode_text.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.decode_text.setLineWrapMode(
+            QTextEdit.LineWrapMode.WidgetWidth
+        )
         self.decode_text.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         self.decode_text.mousePressEvent = self.open_link_if_needed
 
         # 监听文本变化
         self.decode_text.textChanged.connect(self.update_decode_text_size)
-
-        # 初始设置合适的高度
-        self.decode_text.setFixedHeight(int(self.decode_text.document().size().height() + 20))
 
         result_card.body.addWidget(self.decode_text)
         v.addWidget(result_card)
@@ -951,17 +1082,9 @@ class QRApp(QWidget):
         # 加上一些边距（大约20像素）
         needed_height = doc_height + 20
 
-        # 限制最小和最大高度
-        min_height = 30
-        max_height = 300
-
-        if needed_height < min_height:
-            needed_height = min_height
-        elif needed_height > max_height:
-            needed_height = max_height
-
-        # 设置固定高度
-        self.decode_text.setFixedHeight(needed_height)
+        # 内容较少时保持紧凑；内容较多时由文本框内部滚动。
+        preferred_height = max(64, min(240, int(needed_height)))
+        self.decode_text.setMaximumHeight(preferred_height)
 
         # 强制更新布局，确保图片预览区域能重新计算可用空间
         self.decode_text.updateGeometry()
@@ -1033,10 +1156,27 @@ class QRApp(QWidget):
         if not fn:
             return
 
-        pix = QPixmap(fn)
+        self.open_decode_path(fn)
+
+    def open_decode_path(self, filename: str) -> bool:
+        """Load an image selected from a dialog or dropped on the window."""
+        if self._decode_busy:
+            return False
+
+        pix = QPixmap(filename)
+        if pix.isNull():
+            QMessageBox.warning(
+                self,
+                "无法读取图片",
+                "该文件不是受支持的图片，或文件内容已经损坏。",
+            )
+            return False
+
+        self.navigation.setCurrentRow(1)
         self._orig_decode_pixmap = pix
         self.update_decode_preview()
         self.start_decode(pix.toImage(), "解析图片")
+        return True
 
     # ==========================
     #         截屏识别
@@ -1146,21 +1286,8 @@ class QRApp(QWidget):
     #        系统托盘（稳健版）
     # ==========================
     def init_tray(self):
-        # 1) 尝试加载实际文件 ico（如果有）
-        here = os.path.dirname(__file__)
-        ico_path = os.path.join(here, resource_path("icon.ico"))
-        if os.path.exists(ico_path):
-            tray_icon = QIcon(ico_path)
-        else:
-            # 兜底：使用 style() 但包装进 QIcon
-            tray_icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
-            if isinstance(tray_icon, QIcon):
-                pass
-            else:
-                tray_icon = QIcon(tray_icon)
-
-        # 2) 创建 tray 并保存为实例属性（防止被回收）
-        self.tray = QSystemTrayIcon(tray_icon, parent=self)
+        self.tray = QSystemTrayIcon(parent=self)
+        self.update_system_icons()
         self.tray.setToolTip("二维码工具（右键）")
 
         # 3) 创建菜单并保存为实例属性（防止 GC）
@@ -1191,6 +1318,34 @@ class QRApp(QWidget):
 
         # 6) 显示托盘图标
         self.tray.show()
+
+        style_hints = QApplication.instance().styleHints()
+        try:
+            style_hints.colorSchemeChanged.connect(
+                self.on_system_color_scheme_changed
+            )
+        except AttributeError:
+            pass
+
+    def update_system_icons(self):
+        icon_theme = detect_system_tray_theme(self.theme)
+        if getattr(self, "_system_icon_theme", None) != icon_theme:
+            self._system_icon_theme = icon_theme
+            self._system_icon = themed_tray_icon(icon_theme)
+
+        application = QApplication.instance()
+        application.setWindowIcon(self._system_icon)
+        self.setWindowIcon(self._system_icon)
+
+        if hasattr(self, "tray"):
+            self.tray.setIcon(self._system_icon)
+        for widget in application.topLevelWidgets():
+            if isinstance(widget, QMessageBox):
+                widget.setWindowIcon(self._system_icon)
+
+    def on_system_color_scheme_changed(self, _scheme):
+        # Windows 切换系统主题后，注册表值与 Qt 通知可能存在短暂时序差。
+        QTimer.singleShot(100, self.update_system_icons)
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -1232,7 +1387,6 @@ class QRApp(QWidget):
 
 def run() -> int:
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(resource_path("icon.ico")))
     window = QRApp()
     window.show()
     return app.exec()

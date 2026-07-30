@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import sys
 
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import QApplication
 
 
@@ -38,7 +39,7 @@ def theme_colors(theme: str) -> dict[str, str]:
     return DARK_COLORS if theme == "dark" else LIGHT_COLORS
 
 
-def _windows_apps_use_light_theme() -> int:
+def _windows_theme_setting(name: str) -> int:
     import winreg
 
     key_path = (
@@ -49,8 +50,16 @@ def _windows_apps_use_light_theme() -> int:
         winreg.HKEY_CURRENT_USER,
         key_path,
     ) as key:
-        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        value, _ = winreg.QueryValueEx(key, name)
     return int(value)
+
+
+def _windows_apps_use_light_theme() -> int:
+    return _windows_theme_setting("AppsUseLightTheme")
+
+
+def _windows_system_uses_light_theme() -> int:
+    return _windows_theme_setting("SystemUsesLightTheme")
 
 
 def detect_system_theme() -> str:
@@ -76,11 +85,95 @@ def detect_system_theme() -> str:
     return "light"
 
 
+def detect_system_tray_theme(fallback: str = "light") -> str:
+    """Return the Windows taskbar theme used behind the tray icon."""
+    if sys.platform == "win32":
+        try:
+            return (
+                "light"
+                if _windows_system_uses_light_theme()
+                else "dark"
+            )
+        except (OSError, TypeError, ValueError):
+            pass
+
+    application = QApplication.instance()
+    if application is not None:
+        try:
+            scheme = application.styleHints().colorScheme()
+            if getattr(scheme, "name", "") == "Dark":
+                return "dark"
+            if getattr(scheme, "name", "") == "Light":
+                return "light"
+        except (AttributeError, TypeError):
+            pass
+    return "dark" if fallback == "dark" else "light"
+
+
+def system_ui_font():
+    """Return a clearly hinted Windows-native font for Chinese UI text."""
+    system_font = QFontDatabase.systemFont(
+        QFontDatabase.SystemFont.GeneralFont
+    )
+    family = system_font.family()
+    if (
+        sys.platform == "win32"
+        and "Microsoft YaHei" in QFontDatabase.families()
+    ):
+        family = "Microsoft YaHei"
+
+    font = QFont(family)
+    font.setPointSizeF(max(system_font.pointSizeF(), 10.0))
+    font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+    return font
+
+
+def application_palette(theme: str, app: QApplication) -> QPalette:
+    """Return a complete palette for controls still painted by Qt."""
+    if theme != "dark":
+        return app.style().standardPalette()
+
+    palette = QPalette()
+    colors = {
+        QPalette.ColorRole.Window: "#0E1420",
+        QPalette.ColorRole.WindowText: "#E7ECF4",
+        QPalette.ColorRole.Base: "#111926",
+        QPalette.ColorRole.AlternateBase: "#172131",
+        QPalette.ColorRole.ToolTipBase: "#293548",
+        QPalette.ColorRole.ToolTipText: "#FFFFFF",
+        QPalette.ColorRole.Text: "#E7ECF4",
+        QPalette.ColorRole.Button: "#172131",
+        QPalette.ColorRole.ButtonText: "#E7ECF4",
+        QPalette.ColorRole.BrightText: "#FFFFFF",
+        QPalette.ColorRole.Link: "#80B1FF",
+        QPalette.ColorRole.Highlight: "#3B82F6",
+        QPalette.ColorRole.HighlightedText: "#FFFFFF",
+        QPalette.ColorRole.PlaceholderText: "#718096",
+    }
+    for role, color in colors.items():
+        palette.setColor(role, QColor(color))
+
+    palette.setColor(
+        QPalette.ColorGroup.Disabled,
+        QPalette.ColorRole.Text,
+        QColor("#657188"),
+    )
+    palette.setColor(
+        QPalette.ColorGroup.Disabled,
+        QPalette.ColorRole.ButtonText,
+        QColor("#657188"),
+    )
+    palette.setColor(
+        QPalette.ColorGroup.Disabled,
+        QPalette.ColorRole.WindowText,
+        QColor("#657188"),
+    )
+    return palette
+
+
 LIGHT_STYLESHEET = """
 QWidget {
     color: #172033;
-    font-family: "Microsoft YaHei UI", "Segoe UI";
-    font-size: 13px;
 }
 QWidget#appRoot {
     background: #F4F7FB;
@@ -133,9 +226,8 @@ QListWidget#navigation::item {
     border: none;
     border-radius: 9px;
     color: #475467;
-    min-height: 44px;
+    font-weight: 600;
     padding: 0 12px;
-    margin: 2px 0;
 }
 QListWidget#navigation::item:hover {
     background: #F2F4F7;
@@ -341,8 +433,6 @@ QToolTip {
 DARK_STYLESHEET = """
 QWidget {
     color: #E7ECF4;
-    font-family: "Microsoft YaHei UI", "Segoe UI";
-    font-size: 13px;
 }
 QWidget#appRoot {
     background: #0E1420;
@@ -395,9 +485,8 @@ QListWidget#navigation::item {
     border: none;
     border-radius: 9px;
     color: #AEB9C9;
-    min-height: 44px;
+    font-weight: 600;
     padding: 0 12px;
-    margin: 2px 0;
 }
 QListWidget#navigation::item:hover {
     background: #1A2535;
@@ -606,6 +695,8 @@ def apply_theme(app: QApplication, theme: str) -> str:
     normalized = "dark" if theme == "dark" else "light"
     app.setProperty("qrcapTheme", normalized)
     app.setStyle("Fusion")
+    app.setFont(system_ui_font())
+    app.setPalette(application_palette(normalized, app))
     app.setStyleSheet(
         DARK_STYLESHEET if normalized == "dark" else LIGHT_STYLESHEET
     )

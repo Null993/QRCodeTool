@@ -3,8 +3,8 @@ from __future__ import annotations
 import html
 from concurrent.futures import Future, ThreadPoolExecutor
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QTextOption
+from PySide6.QtCore import QObject, QSize, Qt, Signal
+from PySide6.QtGui import QPixmap, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -57,6 +57,7 @@ class EnhancementPage(QWidget):
             self.on_enhancement_verified
         )
         self.refresh_status()
+        self._layout_prewarmed = False
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -149,6 +150,26 @@ class EnhancementPage(QWidget):
         )
         analysis_card.body.addWidget(self.analysis, stretch=1)
         layout.addWidget(analysis_card, stretch=1)
+
+    def prewarm_layout(self) -> None:
+        """Prime rich-text layout and painting before the first tab switch."""
+        if self._layout_prewarmed:
+            return
+
+        self.ensurePolished()
+        target_size = self.size().expandedTo(QSize(640, 520))
+        self.resize(target_size)
+        if self.layout() is not None:
+            self.layout().activate()
+
+        for editor in (self.status_label, self.analysis):
+            editor.ensurePolished()
+            editor.document().documentLayout().documentSize()
+
+        buffer = QPixmap(target_size)
+        buffer.fill(Qt.GlobalColor.transparent)
+        self.render(buffer)
+        self._layout_prewarmed = True
 
     def refresh_status(
         self,
